@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//home/sumedh/snap/arduino/85/.arduino15/**)",
+      "Read(//home/sumedh/snap/arduino/**)",
+      "Bash(/home/sumedh/snap/arduino/85/.arduino15/packages/esp8266/tools/python3/3.7.2-post1/python3 --version)",
+      "Bash(snap run *)",
+      "Bash(ls -la ~/.arduino15 2>&1 | head -5; echo \"---\"; ls -la ~/Arduino 2>&1 | head -5)",
+      "Read(//home/sumedh/**)",
+      "Bash(curl -sL https://api.github.com/repos/arduino/arduino-ide/releases/latest)",
+      "Bash(mkdir -p ~/Arduino ~/Applications && ls -la ~/Applications ~/Arduino)",
+      "Bash(curl -L --fail --progress-bar -o ~/Applications/arduino-ide_2.3.9_Linux_64bit.AppImage https://github.com/arduino/arduino-ide/releases/download/2.3.9/arduino-ide_2.3.9_Linux_64bit.AppImage)",
+      "Bash(dpkg -s libfuse2)",
+      "Bash(dpkg -s libfuse2t64)",
+      "Bash(chmod +x ~/Applications/arduino-ide_2.3.9_Linux_64bit.AppImage)",
+      "Bash(~/Applications/arduino-ide_2.3.9_Linux_64bit.AppImage --appimage-extract '*.desktop')",
+      "Bash(cp /tmp/arduino-extract/squashfs-root/arduino-ide.png ~/.local/share/icons/hicolor/512x512/apps/arduino-ide.png)",
+      "Read(//tmp/arduino-extract/squashfs-root/**)",
+      "Bash(find /tmp/arduino-extract -maxdepth 4 \\\\\\( -name \"arduino-ide.png\" -o -name \"arduino-ide.desktop\" \\\\\\) 2>&1)",
+      "Read(//tmp/arduino-extract/**)",
+      "Bash(~/Applications/arduino-ide_2.3.9_Linux_64bit.AppImage --appimage-extract 'usr/share/icons/hicolor/512x512/apps/arduino-ide.png')",
+      "Bash(cp /tmp/arduino-extract/squashfs-root/usr/share/icons/hicolor/512x512/apps/arduino-ide.png ~/.local/share/icons/hicolor/512x512/apps/arduino-ide.png && cat /tmp/arduino-extract/squashfs-root/arduino-ide.desktop)"
+    ],
+    "additionalDirectories": [
+      "/home/sumedh",
+      "/tmp/arduino-extract/squashfs-root/usr/share/icons/hicolor/512x512/apps"
+    ]
+  }
+}
