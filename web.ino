@@ -561,6 +561,16 @@ input[type=range]::-moz-range-thumb{width:22px;height:22px;border-radius:50%;
 .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
 .toast.error{color:var(--danger)}
 .hidden{display:none !important}
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.5);display:flex;
+  align-items:center;justify-content:center;z-index:200;padding:16px}
+.modal{background:var(--card);border-radius:14px;padding:16px;width:100%;
+  max-width:560px;box-shadow:var(--shadow);max-height:85vh;display:flex;flex-direction:column}
+.modal h3{margin:0 0 6px}
+.modal .hint{color:var(--muted);font-size:.85rem;margin:0 0 10px}
+.modal textarea{width:100%;flex:1;min-height:240px;resize:vertical;box-sizing:border-box;
+  border:1px solid var(--border);border-radius:8px;background:var(--bg);
+  color:var(--text);font-family:monospace;font-size:.8rem;padding:10px}
+.modal-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:12px}
 </style>
 </head>
 <body>
@@ -578,7 +588,31 @@ input[type=range]::-moz-range-thumb{width:22px;height:22px;border-radius:50%;
 </main>
 <div class="sticky-bottom">
   <button class="btn ghost" onclick="addEmpty()">➕ Add</button>
+  <button class="btn ghost" onclick="openImport()">📥 Import</button>
+  <button class="btn ghost" onclick="openExport()">📤 Export</button>
   <button class="btn" onclick="saveAll()">💾 Save All</button>
+</div>
+<div class="modal-overlay hidden" id="importModal">
+  <div class="modal">
+    <h3>Import Schedules</h3>
+    <p class="hint">Paste a schedules JSON array. This replaces the current list — review it, then tap 💾 Save All to keep it.</p>
+    <textarea id="importText" placeholder="[ { &quot;deviceId&quot;: 0, &quot;hour&quot;: 8, ... } ]"></textarea>
+    <div class="modal-actions">
+      <button class="btn ghost" onclick="closeImport()">Cancel</button>
+      <button class="btn" onclick="doImport()">Import</button>
+    </div>
+  </div>
+</div>
+<div class="modal-overlay hidden" id="exportModal">
+  <div class="modal">
+    <h3>Export Schedules</h3>
+    <p class="hint">Copy this JSON to back up or move to another device.</p>
+    <textarea id="exportText" readonly></textarea>
+    <div class="modal-actions">
+      <button class="btn ghost" onclick="closeExport()">Close</button>
+      <button class="btn" onclick="copyExport()">📋 Copy</button>
+    </div>
+  </div>
 </div>
 <div class="toast" id="toast"></div>
 <script>
@@ -776,6 +810,72 @@ async function saveAll(){
     if (res.ok) toast('Saved ✓');
     else toast('Save failed', true);
   }catch(e){ toast('Network error', true); }
+}
+
+function openImport(){
+  document.getElementById('importText').value = '';
+  document.getElementById('importModal').classList.remove('hidden');
+}
+function closeImport(){
+  document.getElementById('importModal').classList.add('hidden');
+}
+function doImport(){
+  const txt = document.getElementById('importText').value.trim();
+  if (!txt){ toast('Paste JSON first', true); return; }
+  let parsed;
+  try { parsed = JSON.parse(txt); }
+  catch(e){ toast('Invalid JSON: ' + e.message, true); return; }
+  if (!Array.isArray(parsed)){ toast('Expected a JSON array', true); return; }
+  // Normalize each entry to the schedule shape, filling sensible defaults.
+  schedules = parsed.map(s => ({
+    deviceId: parseInt(s.deviceId) || 0,
+    hour: parseInt(s.hour) || 0,
+    minute: parseInt(s.minute) || 0,
+    type: s.type || 'on',
+    data: (s.data !== undefined && s.data !== null) ? String(s.data) : '',
+    brightness: (s.brightness !== undefined) ? (parseInt(s.brightness) || 0) : 255,
+    enabled: s.enabled !== false
+  }));
+  closeImport();
+  render();
+  toast('Imported ' + schedules.length + ' — review and Save All');
+}
+
+function schedulesToJSON(){
+  const out = schedules.map(s => {
+    let data = s.data || '';
+    if (s.type === 'color' && data.startsWith('#')) data = data.substring(1);
+    return {
+      deviceId: parseInt(s.deviceId) || 0,
+      hour: parseInt(s.hour) || 0,
+      minute: parseInt(s.minute) || 0,
+      type: s.type,
+      data: String(data),
+      brightness: parseInt(s.brightness) || 255,
+      enabled: !!s.enabled
+    };
+  });
+  return JSON.stringify(out, null, 4);
+}
+function openExport(){
+  document.getElementById('exportText').value = schedulesToJSON();
+  document.getElementById('exportModal').classList.remove('hidden');
+}
+function closeExport(){
+  document.getElementById('exportModal').classList.add('hidden');
+}
+function copyExport(){
+  const ta = document.getElementById('exportText');
+  ta.select();
+  ta.setSelectionRange(0, 999999); // iOS needs an explicit range
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText){
+      navigator.clipboard.writeText(ta.value);
+    } else {
+      document.execCommand('copy');
+    }
+    toast('Copied ✓');
+  } catch(e){ toast('Selected — press Ctrl/Cmd+C', true); }
 }
 
 window.onload = load;
