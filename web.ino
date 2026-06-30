@@ -97,6 +97,7 @@ for (size_t i = 0; i < len; i++) scheduleBody += (char)data[i];
     doc["deviceTime"] = timestr;
     doc["waterLevel"] = waterLevelHigh ? 1 : 0;
     if (!isnan(currentTempC)) doc["tempC"] = currentTempC; // omitted until first valid read
+    doc["tempAlert"] = tempAlertActive;
     String out; serializeJson(doc, out);
     request->send(200, "application/json", out);
   });
@@ -301,7 +302,7 @@ footer{text-align:center;color:var(--muted);font-size:.8rem;padding:20px}
     <div class="card-head">
       <h3 class="card-title">🍽️ Auto Feeder</h3>
       <div class="btn-group">
-        <button class="btn" onclick="step('back',STEPS_PER_REV)">Feed</button>
+        <button class="btn" id="feedBtn">Feed</button>
         <button class="btn off" onclick="step('stop',0)">Stop</button>
       </div>
     </div>
@@ -312,9 +313,11 @@ footer{text-align:center;color:var(--muted);font-size:.8rem;padding:20px}
 <footer>SmartTank © 2025</footer>
 <script>
 const VMAX = 255;
-// Steps for one full Feed turn. 28BYJ-48 full-step ≈ 2048/rev.
-// If one Feed isn't a full 360°, adjust this single number.
+// 28BYJ-48 full-step ≈ 2048/rev (= 360°).
 const STEPS_PER_REV = 2048;
+// One Feed turns 360° + 45° (45° = 1/8 of a rev) -> 2304 steps.
+const FEED_STEPS = STEPS_PER_REV + STEPS_PER_REV / 4;
+document.getElementById('feedBtn').addEventListener('click', () => step('back', FEED_STEPS));
 const DEVICES = [
   {id:0, name:'💦 Water Pump'},
   {id:1, name:'🌬️ Air Pump'},
@@ -460,7 +463,11 @@ async function loadStatus(){
       document.getElementById('waterDot').className = 'dot ' + (high ? 'high' : '');
     }
     if (data.tempC !== undefined && data.tempC !== null){
-      document.getElementById('waterTemp').innerText = data.tempC.toFixed(1) + '°C';
+      const c = data.tempC;
+      const f = c * 9/5 + 32;
+      const el = document.getElementById('waterTemp');
+      el.innerText = c.toFixed(1) + '°C / ' + f.toFixed(1) + '°F';
+      el.style.color = data.tempAlert ? 'var(--danger)' : '';
     }
   }catch(e){}
 }
@@ -716,7 +723,7 @@ function renderDataRow(i){
     });
     schedules[i].data = c;
   } else if (s.type === 'stepper'){
-    const steps = s.data || '2048';
+    const steps = s.data || '2560'; // 360° + 90°, matches the dashboard Feed
     row.innerHTML =
       '<label>Steps</label>' +
       '<div class="field"><input type="number" value="' + steps + '"></div>';

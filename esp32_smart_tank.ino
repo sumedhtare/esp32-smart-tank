@@ -94,6 +94,8 @@ unsigned long lastTempRequest = 0;
 bool tempConversionPending = false;
 const unsigned long TEMP_INTERVAL_MS = 5000; // read every 5s
 const unsigned long TEMP_CONVERSION_MS = 750; // 12-bit conversion time
+const float TEMP_ALERT_C = 32.0; // high-temperature alert threshold (°C)
+bool tempAlertActive = false;
 
 // Start a non-blocking move and energize the coils. loop() de-energizes them
 // once the move finishes, so the motor doesn't stay hot with 2 pins held HIGH.
@@ -119,8 +121,10 @@ void setup() {
   Serial.println();
   Serial.println("SmartTank starting (clean build)...");
 
-  // LittleFS init
-  if (!LittleFS.begin()) {
+  // LittleFS init. Pass true = format-on-fail: an unformatted partition gets
+  // set up once (otherwise the mount fails every boot and saved schedules never
+  // persist — they only live in RAM and vanish on power loss).
+  if (!LittleFS.begin(true)) {
     Serial.println("LittleFS.mount() failed");
   } else {
     Serial.println("LittleFS mounted");
@@ -160,7 +164,7 @@ void setup() {
   // 28BYJ-48 on a ULN2003 slips/skips at higher speeds on 5V (silently dropping
   // steps so a "full" move falls short). 300 sps runs smoothly on this hardware.
   stepper.setMaxSpeed(300);
-  stepper.setAcceleration(200);
+  stepper.setAcceleration(100);
   stepper.disableOutputs(); // start with coils off
 
   // Load schedules
@@ -255,6 +259,15 @@ void loop() {
     float t = tempSensor.getTempCByIndex(0);
     if (t != DEVICE_DISCONNECTED_C) currentTempC = t;
     tempConversionPending = false;
+
+    // High-temperature alert: log only on the rising/falling edge (no spam)
+    bool over = !isnan(currentTempC) && currentTempC >= TEMP_ALERT_C;
+    if (over && !tempAlertActive) {
+      logMsg("⚠️ Temperature HIGH: " + String(currentTempC, 1) + "C");
+    } else if (!over && tempAlertActive) {
+      logMsg("Temperature back to normal: " + String(currentTempC, 1) + "C");
+    }
+    tempAlertActive = over;
   }
 
   // run stepper (non-blocking); de-energize coils once the move completes
