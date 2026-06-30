@@ -92,32 +92,23 @@ void executeScheduleEntry(const ScheduleEntry &s) {
                 s.deviceId, s.hour, s.minute, s.type.c_str(), s.data.c_str(), s.brightness);
 
   if (s.type == "on") {
-    if (s.deviceId < 4 && devicePins[s.deviceId] >= 0) {
-      deviceStates[s.deviceId] = PWM_MAX;
-      analogWrite(devicePins[s.deviceId], deviceStates[s.deviceId]);
-    }
+    if (s.deviceId < 4) setDeviceLevel(s.deviceId, 255);
   } else if (s.type == "off") {
-    if (s.deviceId < 4 && devicePins[s.deviceId] >= 0) {
-      deviceStates[s.deviceId] = 0;
-      analogWrite(devicePins[s.deviceId], 0);
-    }
+    if (s.deviceId < 4) setDeviceLevel(s.deviceId, 0);
   } else if (s.type == "value") {
-    int val = constrain(s.data.toInt(), 0, 255);
-    if (s.deviceId < 4 && devicePins[s.deviceId] >= 0) {
-      deviceStates[s.deviceId] = map(val, 0, 255, 0, PWM_MAX);
-      analogWrite(devicePins[s.deviceId], deviceStates[s.deviceId]);
-    }
+    if (s.deviceId < 4) setDeviceLevel(s.deviceId, s.data.toInt());
   } else if (s.type == "color") {
-    // deviceId for NeoPixel should be 5 by convention; allow user to target 5
+    // NeoPixel strips are device ids 5 and 6 -> strip index 0 and 1
     uint32_t colorHex = 0;
     String c = s.data;
     if (c.startsWith("#")) c = c.substring(1);
     colorHex = (uint32_t) strtoul(c.c_str(), NULL, 16);
-    applyNeoPixelColor(colorHex, s.brightness);
+    uint8_t idx = (s.deviceId == 6) ? 1 : 0;
+    applyNeoPixelColor(idx, colorHex, s.brightness);
   } else if (s.type == "stepper") {
     // stepper: data is steps (positive or negative)
     int steps = s.data.toInt();
-    stepper.move(-steps);
+    stepperMove(-steps);
     // do not block; stepper.run() will be called in loop
   }
 }

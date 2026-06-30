@@ -81,13 +81,13 @@ for (size_t i = 0; i < len; i++) scheduleBody += (char)data[i];
       o["name"] = deviceNames[i];
       if (i < 4) o["state"] = map(deviceStates[i], 0, PWM_MAX, 0, 255);
       else if (i == 4) o["state"] = stepper.currentPosition();
-      else if (i == 5) {
+      else if (i == 5 || i == 6) {
+        uint8_t idx = i - 5;
         JsonObject neo = o.createNestedObject("state");
         char buf[8];
-        // For simplicity send last color as #000000 (no tracking); UI reads schedules for current
-    snprintf(buf, sizeof(buf), "#%06X", lastNeoColor & 0xFFFFFF); // send last color
+        snprintf(buf, sizeof(buf), "#%06X", (unsigned int)(lastNeoColor[idx] & 0xFFFFFF)); // last color
         neo["color"] = buf;
-        neo["brightness"] = neoPixel.getBrightness();
+        neo["brightness"] = neoStrips[idx]->getBrightness();
       }
     }
     time_t now = time(nullptr);
@@ -96,6 +96,7 @@ for (size_t i = 0; i < len; i++) scheduleBody += (char)data[i];
     snprintf(timestr, sizeof(timestr), "%02d:%02d", t->tm_hour, t->tm_min);
     doc["deviceTime"] = timestr;
     doc["waterLevel"] = waterLevelHigh ? 1 : 0;
+    if (!isnan(currentTempC)) doc["tempC"] = currentTempC; // omitted until first valid read
     String out; serializeJson(doc, out);
     request->send(200, "application/json", out);
   });
@@ -112,22 +113,21 @@ for (size_t i = 0; i < len; i++) scheduleBody += (char)data[i];
       return;
     }
 
-    if (id == 5) { // NeoPixel
+    if (id == 5 || id == 6) { // NeoPixel strips
+      uint8_t idx = id - 5;
       String colorStr = "#FF0000";
       uint8_t brightness = 255;
       if (request->hasParam("color", true)) colorStr = request->getParam("color", true)->value();
       if (request->hasParam("brightness", true)) brightness = request->getParam("brightness", true)->value().toInt();
       uint32_t color = strtoul(colorStr.substring(1).c_str(), nullptr, 16);
-      applyNeoPixelColor(color, brightness);
+      applyNeoPixelColor(idx, color, brightness);
     } else {
       if (!request->hasParam("value", true)) {
         request->send(400, "text/plain", "missing value");
         return;
       }
       int val = request->getParam("value", true)->value().toInt();
-      val = constrain(val, 0, 255);
-      deviceStates[id] = map(val, 0, 255, 0, PWM_MAX);
-      if (devicePins[id] >= 0) analogWrite(devicePins[id], deviceStates[id]);
+      setDeviceLevel(id, val);
     }
     request->send(200, "text/plain", "ok");
   });
@@ -142,9 +142,9 @@ for (size_t i = 0; i < len; i++) scheduleBody += (char)data[i];
     int steps = 200;
     if (request->hasParam("steps", true)) steps = request->getParam("steps", true)->value().toInt();
     if (dir == "fwd" || dir == "forward") {
-      stepper.move(steps);
+      stepperMove(steps);
     } else if (dir == "back" || dir == "backward") {
-      stepper.move(-steps);
+      stepperMove(-steps);
     } else if (dir == "stop") {
       stepper.stop();
     }
@@ -225,7 +225,7 @@ h1{margin:0;font-size:1.25rem;text-align:center;font-weight:600}
 .nav a{color:#fff;text-decoration:none;opacity:.9;padding:4px 10px;border-radius:6px}
 .nav a.active{background:rgba(255,255,255,.2)}
 main{max-width:720px;margin:0 auto;padding:16px}
-.status-bar{display:grid;grid-template-columns:1fr 1fr;gap:8px;background:var(--card);
+.status-bar{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px;background:var(--card);
   border-radius:12px;padding:12px;margin-bottom:16px;box-shadow:var(--shadow)}
 .status-item{display:flex;align-items:center;gap:8px;font-size:.9rem}
 .status-item .label{color:var(--muted)}
@@ -290,28 +290,18 @@ footer{text-align:center;color:var(--muted);font-size:.8rem;padding:20px}
       <span class="dot" id="waterDot"></span>
       <span class="value" id="waterLevel">--</span>
     </div>
+    <div class="status-item">
+      <span class="label">🌡️ Temp</span>
+      <span class="value" id="waterTemp">--</span>
+    </div>
   </div>
   <div id="devices"></div>
-  <div class="card">
-    <div class="card-head">
-      <h3 class="card-title">🌈 NeoPixel</h3>
-      <button class="btn" onclick="setNeo()">Apply</button>
-    </div>
-    <div class="color-row">
-      <input type="color" id="neoColor" value="#FF0000">
-      <span class="preview-chip" id="preview" style="background:#FF0000;box-shadow:0 0 14px #FF0000"></span>
-      <span style="color:var(--muted);font-size:.85rem;margin-left:auto">Brightness</span>
-    </div>
-    <div class="slider-row">
-      <input type="range" min="0" max="255" value="255" id="neoBrightness">
-      <input type="number" min="0" max="255" value="255" id="neoBrightnessInput" class="value-input">
-    </div>
-  </div>
+  <div id="neoStrips"></div>
   <div class="card">
     <div class="card-head">
       <h3 class="card-title">🍽️ Auto Feeder</h3>
       <div class="btn-group">
-        <button class="btn" onclick="step('back',2048)">Feed</button>
+        <button class="btn" onclick="step('back',STEPS_PER_REV)">Feed</button>
         <button class="btn off" onclick="step('stop',0)">Stop</button>
       </div>
     </div>
@@ -322,6 +312,9 @@ footer{text-align:center;color:var(--muted);font-size:.8rem;padding:20px}
 <footer>SmartTank © 2025</footer>
 <script>
 const VMAX = 255;
+// Steps for one full Feed turn. 28BYJ-48 full-step ≈ 2048/rev.
+// If one Feed isn't a full 360°, adjust this single number.
+const STEPS_PER_REV = 2048;
 const DEVICES = [
   {id:0, name:'💦 Water Pump'},
   {id:1, name:'🌬️ Air Pump'},
@@ -362,17 +355,41 @@ DEVICES.forEach(d => {
     setVal(d.id, v, false);
   });
 });
-const nb = document.getElementById('neoBrightness');
-const nbi = document.getElementById('neoBrightnessInput');
-nb.addEventListener('input', e => nbi.value = e.target.value);
-nbi.addEventListener('change', e => {
-  let v = Math.max(0, Math.min(255, parseInt(e.target.value) || 0));
-  e.target.value = v; nb.value = v;
-});
-document.getElementById('neoColor').addEventListener('input', e => {
-  const p = document.getElementById('preview');
-  p.style.background = e.target.value;
-  p.style.boxShadow = '0 0 14px ' + e.target.value;
+const NEO = [
+  {id:5, name:'🌈 NeoPixel 1'},
+  {id:6, name:'🌈 NeoPixel 2'}
+];
+const neoContainer = document.getElementById('neoStrips');
+NEO.forEach(n => {
+  const card = document.createElement('div');
+  card.className = 'card';
+  card.innerHTML =
+    '<div class="card-head">' +
+      '<h3 class="card-title">' + n.name + '</h3>' +
+      '<button class="btn" onclick="setNeo(' + n.id + ')">Apply</button>' +
+    '</div>' +
+    '<div class="color-row">' +
+      '<input type="color" id="neoColor' + n.id + '" value="#FF0000">' +
+      '<span class="preview-chip" id="preview' + n.id + '" style="background:#FF0000;box-shadow:0 0 14px #FF0000"></span>' +
+      '<span style="color:var(--muted);font-size:.85rem;margin-left:auto">Brightness</span>' +
+    '</div>' +
+    '<div class="slider-row">' +
+      '<input type="range" min="0" max="255" value="255" id="neoBrightness' + n.id + '">' +
+      '<input type="number" min="0" max="255" value="255" id="neoBrightnessInput' + n.id + '" class="value-input">' +
+    '</div>';
+  neoContainer.appendChild(card);
+  const nb = document.getElementById('neoBrightness' + n.id);
+  const nbi = document.getElementById('neoBrightnessInput' + n.id);
+  nb.addEventListener('input', e => nbi.value = e.target.value);
+  nbi.addEventListener('change', e => {
+    let v = Math.max(0, Math.min(255, parseInt(e.target.value) || 0));
+    e.target.value = v; nb.value = v;
+  });
+  document.getElementById('neoColor' + n.id).addEventListener('input', e => {
+    const p = document.getElementById('preview' + n.id);
+    p.style.background = e.target.value;
+    p.style.boxShadow = '0 0 14px ' + e.target.value;
+  });
 });
 function toast(msg, isError){
   const t = document.getElementById('toast');
@@ -394,13 +411,13 @@ async function setVal(id, val, notify){
     if (notify !== false) toast('Updated');
   }catch(e){ toast('Network error', true); }
 }
-async function setNeo(){
-  const color = document.getElementById('neoColor').value;
-  const br = document.getElementById('neoBrightness').value;
+async function setNeo(id){
+  const color = document.getElementById('neoColor' + id).value;
+  const br = document.getElementById('neoBrightness' + id).value;
   try{
     await fetch('/control', {method:'POST',
       headers:{'Content-Type':'application/x-www-form-urlencoded'},
-      body:'id=5&color=' + encodeURIComponent(color) + '&brightness=' + br});
+      body:'id=' + id + '&color=' + encodeURIComponent(color) + '&brightness=' + br});
     toast('NeoPixel updated');
   }catch(e){ toast('Network error', true); }
 }
@@ -423,15 +440,17 @@ async function loadStatus(){
         if (s) s.value = dev.state;
       } else if (i === 4){
         document.getElementById('stepPos').innerText = dev.state;
-      } else if (i === 5){
-        const color = dev.state.color || '#FF0000';
-        const br = dev.state.brightness || 255;
-        document.getElementById('neoColor').value = color;
-        document.getElementById('neoBrightness').value = br;
-        document.getElementById('neoBrightnessInput').value = br;
-        const p = document.getElementById('preview');
-        p.style.background = color;
-        p.style.boxShadow = '0 0 14px ' + color;
+      } else if (i === 5 || i === 6){
+        const color = (dev.state && dev.state.color) || '#FF0000';
+        const br = (dev.state && dev.state.brightness) || 255;
+        const cEl = document.getElementById('neoColor' + i);
+        const bEl = document.getElementById('neoBrightness' + i);
+        const biEl = document.getElementById('neoBrightnessInput' + i);
+        if (cEl) cEl.value = color;
+        if (bEl) bEl.value = br;
+        if (biEl) biEl.value = br;
+        const p = document.getElementById('preview' + i);
+        if (p){ p.style.background = color; p.style.boxShadow = '0 0 14px ' + color; }
       }
     });
     if (data.deviceTime) document.getElementById('deviceTime').innerText = data.deviceTime;
@@ -439,6 +458,9 @@ async function loadStatus(){
       const high = !!data.waterLevel;
       document.getElementById('waterLevel').innerText = high ? 'HIGH' : 'LOW';
       document.getElementById('waterDot').className = 'dot ' + (high ? 'high' : '');
+    }
+    if (data.tempC !== undefined && data.tempC !== null){
+      document.getElementById('waterTemp').innerText = data.tempC.toFixed(1) + '°C';
     }
   }catch(e){}
 }
@@ -554,7 +576,7 @@ input[type=range]::-moz-range-thumb{width:22px;height:22px;border-radius:50%;
 <div class="toast" id="toast"></div>
 <script>
 const VMAX = 255;
-const DEV_NAMES = ["💦 Water pump","🌬️ Air pump","💡 LED","🔆 UV","🍽️ Auto feeder","🌈 Neo Pixel"];
+const DEV_NAMES = ["💦 Water pump","🌬️ Air pump","💡 LED","🔆 UV","🍽️ Auto feeder","🌈 Neo Pixel","🌈 Neo Pixel 2"];
 let schedules = [];
 
 function toast(msg, isError){
