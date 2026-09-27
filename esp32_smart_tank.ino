@@ -47,12 +47,13 @@ float currentTempC = NAN;             // last good reading; NaN until first read
 const char* MDNS_NAME = "smarttank";
 const char* NTP_POOL = "pool.ntp.org";
 const char* SCHEDULE_FILE = "/schedules.json";
+const char* STEPPER_FILE = "/stepper.json";
 
-const int DEVICE_COUNT = 7; // 0: pump1, 1: pump2, 2: led1, 3: uv/led2, 4: stepper, 5: NeoPixel, 6: NeoPixel2
+const int DEVICE_COUNT = 7; // 0: pump1, 1: pump2, 2: led1, 3: plant feeder, 4: stepper, 5: lamp (NeoPixel), 6: RGB light (NeoPixel2)
 const int PWM_MAX = 1023;
 
 // device names for UI/status
-const char* deviceNames[DEVICE_COUNT] = { "Water pump", "Air pump", "LED", "UV", "Auto feeder", "Neo Pixel", "Neo Pixel 2" };
+const char* deviceNames[DEVICE_COUNT] = { "Water pump", "Air pump", "LED", "Plant feeder", "Auto feeder", "Lamp", "RGB light" };
 int devicePins[DEVICE_COUNT] = { PUMP1_PIN, PUMP2_PIN, LED1_PIN, LED2_PIN, -1, -1, -1 };
 
 // runtime state
@@ -60,8 +61,31 @@ int deviceStates[DEVICE_COUNT]; // 0..PWM_MAX for PWM; for stepper we store last
 bool waterLevelHigh = false;
 
 // Stepper
-AccelStepper stepper(AccelStepper::FULL4WIRE, STEPPER_PIN1, STEPPER_PIN3, STEPPER_PIN2, STEPPER_PIN4);
-bool stepperOutputsOn = false;
+// AccelStepper fixes the drive mode at construction, so keep one instance per
+// mode on the same pins and point `stepper` at the active one.
+// Full step: 2048 steps/rev (most torque). Half step: 4096 steps/rev (smoother).
+// Pin order matches this board's wiring to the ULN2003. A wrong order still
+// spins the motor, but weakly and in one direction whatever the commanded
+// direction (the textbook IN1,IN3,IN2,IN4 order did exactly that here).
+AccelStepper stepperFull(AccelStepper::FULL4WIRE, STEPPER_PIN1, STEPPER_PIN2, STEPPER_PIN3, STEPPER_PIN4);
+AccelStepper stepperHalf(AccelStepper::HALF4WIRE, STEPPER_PIN1, STEPPER_PIN2, STEPPER_PIN3, STEPPER_PIN4);
+AccelStepper *stepper = &stepperFull;
+// AccelStepper isn't thread-safe, so web/schedule requests are handed to
+// stepperTask through these instead of touching `stepper` directly.
+portMUX_TYPE stepperMux = portMUX_INITIALIZER_UNLOCKED;
+long stepperPendingMove = 0;
+bool stepperHasPendingMove = false;
+bool stepperPendingStop = false;
+long stepperPendingReturn = 0; // move to run once stepperPendingMove finishes (nudge)
+// Sign of a clockwise move. Flip to -1 if Nudge turns anti-clockwise first.
+const int STEPPER_CW = 1;
+// Nudge: turn this many degrees clockwise, then back. Set from the dashboard.
+float stepperNudgeDeg = 10;
+// Speed (steps/s) and acceleration (steps/s^2), tunable from the dashboard.
+float stepperMaxSpeed = 300;
+float stepperAccel = 200;
+bool stepperHalfStep = false;
+bool stepperHasPendingTuning = false;
 
 // Web / networking
 AsyncWebServer server(80);
@@ -97,12 +121,172 @@ const unsigned long TEMP_CONVERSION_MS = 750; // 12-bit conversion time
 const float TEMP_ALERT_C = 32.0; // high-temperature alert threshold (°C)
 bool tempAlertActive = false;
 
-// Start a non-blocking move and energize the coils. loop() de-energizes them
-// once the move finishes, so the motor doesn't stay hot with 2 pins held HIGH.
+// Queue a relative move for stepperTask (non-blocking, callable from any task).
 void stepperMove(long steps) {
-  stepper.enableOutputs();
-  stepperOutputsOn = true;
-  stepper.move(steps);
+  portENTER_CRITICAL(&stepperMux);
+  stepperPendingMove = steps;
+  stepperPendingReturn = 0;
+  stepperHasPendingMove = true;
+  portEXIT_CRITICAL(&stepperMux);
+}
+
+// Queue a nudge: stepperNudgeDeg clockwise, then back anti-clockwise.
+void stepperNudge() {
+  long steps = STEPPER_CW * lroundf(stepperNudgeDeg * stepperStepsPerRev() / 360.0f);
+  portENTER_CRITICAL(&stepperMux);
+  stepperPendingMove = steps;
+  stepperPendingReturn = -steps;
+  stepperHasPendingMove = true;
+  portEXIT_CRITICAL(&stepperMux);
+}
+
+// Returns true if the nudge angle changed.
+bool stepperSetNudgeDeg(float deg) {
+  deg = constrain(deg, 1, 360);
+  bool changed = deg != stepperNudgeDeg;
+  stepperNudgeDeg = deg;
+  return changed;
+}
+
+// Queue new speed/acceleration for stepperTask; applies to the current move too.
+// A step-mode change waits until the motor is idle. Returns true if anything changed.
+bool stepperSetTuning(float maxSpeed, float accel, bool halfStep) {
+  maxSpeed = constrain(maxSpeed, 1, 2000);
+  accel = constrain(accel, 1, 5000);
+  portENTER_CRITICAL(&stepperMux);
+  bool changed = halfStep != stepperHalfStep || maxSpeed != stepperMaxSpeed || accel != stepperAccel;
+  stepperHalfStep = halfStep;
+  stepperMaxSpeed = maxSpeed;
+  stepperAccel = accel;
+  stepperHasPendingTuning = true;
+  portEXIT_CRITICAL(&stepperMux);
+  return changed;
+}
+
+// Steps for one 360° turn in the current step mode.
+long stepperStepsPerRev() {
+  return stepperHalfStep ? 4096 : 2048;
+}
+
+// Persist mode/speed/accel so scheduled feeds use them after a reboot.
+void stepperSaveConfig() {
+  File f = LittleFS.open(STEPPER_FILE, "w");
+  if (!f) {
+    logMsg("Failed to open stepper config for write");
+    return;
+  }
+  StaticJsonDocument<128> doc;
+  doc["mode"] = stepperHalfStep ? "half" : "full";
+  doc["speed"] = stepperMaxSpeed;
+  doc["accel"] = stepperAccel;
+  doc["nudge"] = stepperNudgeDeg;
+  serializeJson(doc, f);
+  f.close();
+  logMsg("Stepper config saved");
+}
+
+void stepperLoadConfig() {
+  File f = LittleFS.open(STEPPER_FILE, "r");
+  if (!f) return; // keep defaults
+  StaticJsonDocument<128> doc;
+  DeserializationError err = deserializeJson(doc, f);
+  f.close();
+  if (err) return;
+  stepperSetTuning(doc["speed"] | stepperMaxSpeed, doc["accel"] | stepperAccel,
+                   String(doc["mode"] | "full") == "half");
+  stepperSetNudgeDeg(doc["nudge"] | stepperNudgeDeg);
+}
+
+// Queue a decelerating stop for stepperTask.
+void stepperStop() {
+  portENTER_CRITICAL(&stepperMux);
+  stepperHasPendingMove = false;
+  stepperPendingReturn = 0;
+  stepperPendingStop = true;
+  portEXIT_CRITICAL(&stepperMux);
+}
+
+// Drives the stepper on core 0, away from loop() (NeoPixel show(), DS18B20
+// reads), whose stalls made steps late and uneven so the motor ran slow and
+// skipped. Coils are energized only while moving so the motor doesn't stay hot.
+void stepperTask(void *) {
+  bool outputsOn = false;
+  long returnMove = 0; // second leg of a nudge, run when the first finishes
+  // Nudges run at constant speed (no ramps) so the reversal has no pause
+  bool constantSpeed = false;
+  unsigned long lastYield = millis();
+  for (;;) {
+    portENTER_CRITICAL(&stepperMux);
+    bool hasMove = stepperHasPendingMove;
+    long move = stepperPendingMove;
+    long ret = stepperPendingReturn;
+    bool stop = stepperPendingStop;
+    bool hasTuning = stepperHasPendingTuning;
+    float maxSpeed = stepperMaxSpeed;
+    float accel = stepperAccel;
+    bool halfStep = stepperHalfStep;
+    stepperHasPendingMove = stepperPendingStop = stepperHasPendingTuning = false;
+    portEXIT_CRITICAL(&stepperMux);
+
+    AccelStepper *wanted = halfStep ? &stepperHalf : &stepperFull;
+    if (wanted != stepper && stepper->distanceToGo() == 0 && returnMove == 0) {
+      // Carry the position over, rescaled to the new mode's steps/rev
+      long pos = stepper->currentPosition();
+      wanted->setCurrentPosition(halfStep ? pos * 2 : pos / 2);
+      stepper = wanted;
+      hasTuning = true;
+    }
+    if (hasTuning) {
+      stepper->setMaxSpeed(maxSpeed);
+      stepper->setAcceleration(accel);
+      if (constantSpeed) stepper->setSpeed(stepper->distanceToGo() < 0 ? -maxSpeed : maxSpeed);
+    }
+    if (stop) {
+      returnMove = 0;
+      if (constantSpeed) stepper->moveTo(stepper->currentPosition()); // no ramp to stop
+      else stepper->stop();
+    }
+    if (hasMove) {
+      returnMove = ret;
+      constantSpeed = ret != 0;
+      if (!outputsOn) {
+        stepper->enableOutputs();
+        outputsOn = true;
+      }
+      stepper->move(move);
+      // move() recomputes the ramp speed, so set the constant speed after it
+      if (constantSpeed) stepper->setSpeed(move < 0 ? -maxSpeed : maxSpeed);
+    } else if (returnMove != 0 && stepper->distanceToGo() == 0) {
+      // Reverse straight away at full speed; coils still on from the first leg
+      stepper->move(returnMove);
+      stepper->setSpeed(returnMove < 0 ? -maxSpeed : maxSpeed);
+      returnMove = 0;
+    }
+
+    if (stepper->distanceToGo() != 0) {
+      if (constantSpeed) stepper->runSpeedToPosition();
+      else stepper->run();
+      // Busy-run for accurate step timing, but give IDLE0 a tick every 100ms
+      // so the task watchdog stays fed.
+      if (millis() - lastYield >= 100) {
+        vTaskDelay(1);
+        lastYield = millis();
+      }
+    } else {
+      if (constantSpeed) {
+        // runSpeedToPosition() leaves AccelStepper's ramp state (_n/_cn) stale,
+        // which made the next Feed crawl; setCurrentPosition() resets it.
+        stepper->setCurrentPosition(stepper->currentPosition());
+        constantSpeed = false;
+      }
+      if (outputsOn) {
+        stepper->disableOutputs();
+        outputsOn = false;
+      }
+      vTaskDelay(pdMS_TO_TICKS(5));
+      lastYield = millis();
+    }
+  }
 }
 
 // Drive a PWM device from a 0..255 value. At max (255) we write the LEDC
@@ -160,12 +344,13 @@ void setup() {
   }
   pinMode(WATER_LEVEL_PIN, INPUT);
 
-  // Stepper
-  // 28BYJ-48 on a ULN2003 slips/skips at higher speeds on 5V (silently dropping
-  // steps so a "full" move falls short). 300 sps runs smoothly on this hardware.
-  stepper.setMaxSpeed(300);
-  stepper.setAcceleration(100);
-  stepper.disableOutputs(); // start with coils off
+  // Stepper (28BYJ-48 on a ULN2003 at 5V). stepperTask applies the saved mode.
+  stepperLoadConfig();
+  stepper->setMaxSpeed(stepperMaxSpeed);
+  stepper->setAcceleration(stepperAccel);
+  stepperFull.disableOutputs(); // start with coils off (both share the pins)
+  stepperHalf.disableOutputs();
+  xTaskCreatePinnedToCore(stepperTask, "stepper", 4096, NULL, 1, NULL, 0);
 
   // Load schedules
   loadSchedulesFromFS();
@@ -268,13 +453,6 @@ void loop() {
       logMsg("Temperature back to normal: " + String(currentTempC, 1) + "C");
     }
     tempAlertActive = over;
-  }
-
-  // run stepper (non-blocking); de-energize coils once the move completes
-  stepper.run();
-  if (stepperOutputsOn && stepper.distanceToGo() == 0) {
-    stepper.disableOutputs();
-    stepperOutputsOn = false;
   }
 
   // yield

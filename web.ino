@@ -80,7 +80,7 @@ for (size_t i = 0; i < len; i++) scheduleBody += (char)data[i];
       JsonObject o = arr.createNestedObject();
       o["name"] = deviceNames[i];
       if (i < 4) o["state"] = map(deviceStates[i], 0, PWM_MAX, 0, 255);
-      else if (i == 4) o["state"] = stepper.currentPosition();
+      else if (i == 4) o["state"] = stepper->currentPosition();
       else if (i == 5 || i == 6) {
         uint8_t idx = i - 5;
         JsonObject neo = o.createNestedObject("state");
@@ -98,6 +98,11 @@ for (size_t i = 0; i < len; i++) scheduleBody += (char)data[i];
     doc["waterLevel"] = waterLevelHigh ? 1 : 0;
     if (!isnan(currentTempC)) doc["tempC"] = currentTempC; // omitted until first valid read
     doc["tempAlert"] = tempAlertActive;
+    JsonObject st = doc.createNestedObject("stepper");
+    st["speed"] = stepperMaxSpeed;
+    st["accel"] = stepperAccel;
+    st["mode"] = stepperHalfStep ? "half" : "full";
+    st["nudge"] = stepperNudgeDeg;
     String out; serializeJson(doc, out);
     request->send(200, "application/json", out);
   });
@@ -133,6 +138,23 @@ for (size_t i = 0; i < len; i++) scheduleBody += (char)data[i];
     request->send(200, "text/plain", "ok");
   });
 
+  // stepper config (mode/speed/accel), persisted for scheduled feeds.
+  // Not "/stepper/config": that would be caught by the "/stepper" route.
+  server.on("/stepperConfig", HTTP_POST, [](AsyncWebServerRequest * request) {
+    if (!request->hasParam("speed", true) || !request->hasParam("accel", true)) {
+      request->send(400, "text/plain", "missing");
+      return;
+    }
+    bool half = request->hasParam("mode", true) && request->getParam("mode", true)->value() == "half";
+    bool changed = stepperSetTuning(request->getParam("speed", true)->value().toFloat(),
+                                    request->getParam("accel", true)->value().toFloat(), half);
+    if (request->hasParam("nudge", true)) {
+      changed |= stepperSetNudgeDeg(request->getParam("nudge", true)->value().toFloat());
+    }
+    if (changed) stepperSaveConfig();
+    request->send(200, "text/plain", "ok");
+  });
+
   // stepper control
   server.on("/stepper", HTTP_POST, [](AsyncWebServerRequest * request) {
     if (!request->hasParam("dir", true)) {
@@ -146,8 +168,10 @@ for (size_t i = 0; i < len; i++) scheduleBody += (char)data[i];
       stepperMove(steps);
     } else if (dir == "back" || dir == "backward") {
       stepperMove(-steps);
+    } else if (dir == "nudge") {
+      stepperNudge();
     } else if (dir == "stop") {
-      stepper.stop();
+      stepperStop();
     }
     request->send(200, "text/plain", "ok");
   });
@@ -245,6 +269,13 @@ main{max-width:720px;margin:0 auto;padding:16px}
   min-height:38px;transition:transform .08s}
 .btn:active{transform:scale(.95)}
 .btn.off{background:var(--muted)}
+.btn:disabled, .value-input:disabled{opacity:.4;cursor:not-allowed;transform:none}
+.switch{width:34px;height:20px;border-radius:10px;background:var(--border);border:none;
+  padding:0;position:relative;cursor:pointer;transition:.2s;flex-shrink:0;align-self:center}
+.switch[aria-checked=true]{background:var(--success)}
+.switch::after{content:'';position:absolute;top:3px;left:3px;width:14px;height:14px;
+  border-radius:50%;background:#fff;transition:.2s;box-shadow:0 1px 3px rgba(0,0,0,.3)}
+.switch[aria-checked=true]::after{transform:translateX(14px)}
 .slider-row{display:flex;align-items:center;gap:10px;margin-top:10px}
 input[type=range]{-webkit-appearance:none;appearance:none;flex:1;height:6px;
   background:var(--border);border-radius:3px;outline:none}
@@ -302,9 +333,25 @@ footer{text-align:center;color:var(--muted);font-size:.8rem;padding:20px}
     <div class="card-head">
       <h3 class="card-title">🍽️ Auto Feeder</h3>
       <div class="btn-group">
-        <button class="btn" id="feedBtn">Feed</button>
+        <button class="switch" id="feedLock" role="switch" aria-checked="false"
+          aria-label="Unlock Feed and feeder settings" title="Unlock Feed and feeder settings"></button>
+        <button class="btn" id="feedBtn" disabled>Feed</button>
+        <button class="btn" id="nudgeBtn">Nudge</button>
         <button class="btn off" onclick="step('stop',0)">Stop</button>
       </div>
+    </div>
+    <div class="slider-row" style="gap:12px;flex-wrap:wrap">
+      <label style="color:var(--muted);font-size:.85rem">Speed (steps/s)
+        <input type="number" min="1" max="2000" id="stepSpeed" value="800" class="value-input"></label>
+      <label style="color:var(--muted);font-size:.85rem">Accel (steps/s²)
+        <input type="number" min="1" max="5000" id="stepAccel" value="400" class="value-input"></label>
+      <label style="color:var(--muted);font-size:.85rem">Mode
+        <select id="stepMode" class="value-input" style="width:auto">
+          <option value="full">Full (2048/rev)</option>
+          <option value="half">Half (4096/rev)</option>
+        </select></label>
+      <label style="color:var(--muted);font-size:.85rem">Nudge (°)
+        <input type="number" min="1" max="360" id="stepNudge" value="10" class="value-input"></label>
     </div>
     <div style="color:var(--muted);font-size:.85rem">Position: <span id="stepPos">0</span></div>
   </div>
@@ -313,16 +360,45 @@ footer{text-align:center;color:var(--muted);font-size:.8rem;padding:20px}
 <footer>SmartTank © 2025</footer>
 <script>
 const VMAX = 255;
-// 28BYJ-48 full-step ≈ 2048/rev (= 360°).
-const STEPS_PER_REV = 2048;
-// One Feed turns 360° + 45° (45° = 1/8 of a rev) -> 2304 steps.
-const FEED_STEPS = STEPS_PER_REV + STEPS_PER_REV / 4;
-document.getElementById('feedBtn').addEventListener('click', () => step('back', FEED_STEPS));
+// 28BYJ-48 steps per 360° for each step mode.
+const STEPS_PER_REV = {full: 2048, half: 4096};
+// One Feed = exactly one full rotation.
+// Feed and the feeder settings are locked by default; the switch unlocks
+// them, and they re-lock after a feed. Nudge stays available.
+const feedBtn = document.getElementById('feedBtn');
+const feedLock = document.getElementById('feedLock');
+const FEEDER_SETTINGS = ['stepSpeed', 'stepAccel', 'stepMode', 'stepNudge'];
+function setFeedEnabled(on){
+  feedLock.setAttribute('aria-checked', on);
+  feedBtn.disabled = !on;
+  FEEDER_SETTINGS.forEach(id => document.getElementById(id).disabled = !on);
+}
+feedLock.addEventListener('click', () => setFeedEnabled(feedBtn.disabled));
+setFeedEnabled(false);
+feedBtn.addEventListener('click', () => {
+  setFeedEnabled(false); // re-lock after each feed
+  step('fwd', STEPS_PER_REV[document.getElementById('stepMode').value]);
+});
+// Nudge: Nudge° clockwise then back; the device computes the steps
+document.getElementById('nudgeBtn').addEventListener('click', () => step('nudge', 0));
+// Save mode/speed/accel on the device as soon as they change (schedules use them)
+function saveStepperConfig(quiet){
+  return fetch('/stepperConfig', {method:'POST',
+    headers:{'Content-Type':'application/x-www-form-urlencoded'},
+    body:'speed=' + document.getElementById('stepSpeed').value +
+         '&accel=' + document.getElementById('stepAccel').value +
+         '&mode=' + document.getElementById('stepMode').value +
+         '&nudge=' + document.getElementById('stepNudge').value})
+   .then(r => { if (!r.ok) throw 0; if (quiet !== true) toast('Feeder settings saved'); })
+   .catch(() => toast('Network error', true));
+}
+FEEDER_SETTINGS.forEach(id =>
+  document.getElementById(id).addEventListener('change', saveStepperConfig));
 const DEVICES = [
   {id:0, name:'💦 Water Pump'},
   {id:1, name:'🌬️ Air Pump'},
   {id:2, name:'💡 LED Light'},
-  {id:3, name:'🔆 UV Light'}
+  {id:3, name:'🌱 Plant Feeder'}
 ];
 const container = document.getElementById('devices');
 DEVICES.forEach(d => {
@@ -359,8 +435,8 @@ DEVICES.forEach(d => {
   });
 });
 const NEO = [
-  {id:5, name:'🌈 NeoPixel 1'},
-  {id:6, name:'🌈 NeoPixel 2'}
+  {id:5, name:'🏮 Lamp'},
+  {id:6, name:'🌈 RGB Light'}
 ];
 const neoContainer = document.getElementById('neoStrips');
 NEO.forEach(n => {
@@ -421,10 +497,14 @@ async function setNeo(id){
     await fetch('/control', {method:'POST',
       headers:{'Content-Type':'application/x-www-form-urlencoded'},
       body:'id=' + id + '&color=' + encodeURIComponent(color) + '&brightness=' + br});
-    toast('NeoPixel updated');
+    toast('Light updated');
   }catch(e){ toast('Network error', true); }
 }
-function step(dir, steps){
+let stepperTuningLoaded = false; // fill Speed/Accel from device once, then leave user edits alone
+async function step(dir, steps){
+  // Make sure the move runs with the settings shown (Feed may be pressed
+  // before the field's change event fired)
+  if (dir !== 'stop') await saveStepperConfig(true);
   fetch('/stepper', {method:'POST',
     headers:{'Content-Type':'application/x-www-form-urlencoded'},
     body:'dir=' + dir + '&steps=' + steps})
@@ -443,6 +523,13 @@ async function loadStatus(){
         if (s) s.value = dev.state;
       } else if (i === 4){
         document.getElementById('stepPos').innerText = dev.state;
+        if (!stepperTuningLoaded && data.stepper){
+          document.getElementById('stepSpeed').value = data.stepper.speed;
+          document.getElementById('stepAccel').value = data.stepper.accel;
+          document.getElementById('stepMode').value = data.stepper.mode;
+          document.getElementById('stepNudge').value = data.stepper.nudge;
+          stepperTuningLoaded = true;
+        }
       } else if (i === 5 || i === 6){
         const color = (dev.state && dev.state.color) || '#FF0000';
         const br = (dev.state && dev.state.brightness) || 255;
@@ -617,7 +704,7 @@ input[type=range]::-moz-range-thumb{width:22px;height:22px;border-radius:50%;
 <div class="toast" id="toast"></div>
 <script>
 const VMAX = 255;
-const DEV_NAMES = ["💦 Water pump","🌬️ Air pump","💡 LED","🔆 UV","🍽️ Auto feeder","🌈 Neo Pixel","🌈 Neo Pixel 2"];
+const DEV_NAMES = ["💦 Water pump","🌬️ Air pump","💡 LED","🌱 Plant feeder","🍽️ Auto feeder","🏮 Lamp","🌈 RGB light"];
 let schedules = [];
 
 function toast(msg, isError){
@@ -664,8 +751,10 @@ function render(){
     const devOptions = DEV_NAMES.map((n, idx) =>
       '<option value="' + idx + '"' + (s.deviceId == idx ? ' selected' : '') + '>' + n + '</option>').join('');
 
-    const typeOptions = ['on','off','value','color','stepper'].map(t =>
-      '<option value="' + t + '"' + (s.type === t ? ' selected' : '') + '>' + t.toUpperCase() + '</option>').join('');
+    // 'stepper' is the stored name for a Feed (kept for existing schedules)
+    const TYPE_LABELS = {stepper: 'FEED'};
+    const typeOptions = ['on','off','value','color','stepper','nudge'].map(t =>
+      '<option value="' + t + '"' + (s.type === t ? ' selected' : '') + '>' + (TYPE_LABELS[t] || t.toUpperCase()) + '</option>').join('');
 
     card.innerHTML =
       '<div class="row">' +
@@ -724,7 +813,8 @@ function render(){
 function renderDataRow(i){
   const s = schedules[i];
   const row = document.getElementById('data-row-' + i);
-  if (s.type === 'on' || s.type === 'off'){
+  // nudge has no data: it uses the feeder's saved Nudge (°)
+  if (s.type === 'on' || s.type === 'off' || s.type === 'nudge'){
     row.innerHTML = '';
     row.classList.add('hidden');
     return;
@@ -757,10 +847,11 @@ function renderDataRow(i){
     });
     schedules[i].data = c;
   } else if (s.type === 'stepper'){
-    const steps = s.data || '2560'; // 360° + 90°, matches the dashboard Feed
+    // Rotations; the device converts to steps using the feeder's saved mode
+    const steps = s.data || '1';
     row.innerHTML =
-      '<label>Steps</label>' +
-      '<div class="field"><input type="number" value="' + steps + '"></div>';
+      '<label>Rotations</label>' +
+      '<div class="field"><input type="number" min="0" step="0.25" value="' + steps + '"></div>';
     row.querySelector('input').addEventListener('input', e => {
       schedules[i].data = e.target.value;
     });

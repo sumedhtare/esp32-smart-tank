@@ -48,6 +48,14 @@ bool loadSchedulesFromFS() {
       }
     }
 
+    // One-time migration: `stepper` schedules used raw step counts (full-step,
+    // 2048/rev). They now store rotations, converted using the current step mode.
+    if (s.type == "stepper" && s.data.toFloat() >= 100) {
+      s.data = String(s.data.toFloat() / 2048.0f, 2);
+      needsResave = true;
+      Serial.printf("Migrated stepper schedule -> %s rotations\n", s.data.c_str());
+    }
+
     schedules.push_back(s);
   }
   Serial.printf("Loaded %u schedules\n", (unsigned)schedules.size());
@@ -106,9 +114,11 @@ void executeScheduleEntry(const ScheduleEntry &s) {
     uint8_t idx = (s.deviceId == 6) ? 1 : 0;
     applyNeoPixelColor(idx, colorHex, s.brightness);
   } else if (s.type == "stepper") {
-    // stepper: data is steps (positive or negative)
-    int steps = s.data.toInt();
-    stepperMove(-steps);
-    // do not block; stepper.run() will be called in loop
+    // stepper: data is rotations; uses the dashboard's saved mode/speed/accel
+    long steps = lroundf(s.data.toFloat() * stepperStepsPerRev());
+    stepperMove(steps); // same direction as the dashboard Feed (fwd)
+  } else if (s.type == "nudge") {
+    // uses the dashboard's saved Nudge (°), speed and mode
+    stepperNudge();
   }
 }

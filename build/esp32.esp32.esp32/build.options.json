@@ -1,0 +1,9 @@
+{
+  "additionalFiles": "../../..",
+  "compiler.optimization_flags": "-Os",
+  "customBuildProperties": "",
+  "fqbn": "esp32:esp32:esp32",
+  "hardwareFolders": "/home/sumedh/.arduino15/packages/esp32/hardware/esp32/3.3.8,/home/sumedh/.arduino15/packages/esp32/hardware/esp32/3.3.8",
+  "otherLibrariesFolders": "/home/sumedh/Arduino/libraries",
+  "sketchLocation": "/home/sumedh/Documents/esp32_smart_tank"
+}
